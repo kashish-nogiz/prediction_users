@@ -1,7 +1,7 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from typing import List, Optional, Dict
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 import joblib
 import pandas as pd
 import math
@@ -12,16 +12,14 @@ from shapely.geometry import Point, Polygon
 import redis
 import uvicorn
 
-
-
-week={
-    'monday':0,
-    'tuesday':1,
-    'wednesday':2,
-    'thursday':3,
-    'friday':4,
-    'saturday':5,
-    'sunday':6
+week = {
+    'monday': 0,
+    'tuesday': 1,
+    'wednesday': 2,
+    'thursday': 3,
+    'friday': 4,
+    'saturday': 5,
+    'sunday': 6
 }
 
 # Initialize FastAPI app
@@ -41,7 +39,9 @@ redis_client = None
 class PredictionRequest(BaseModel):
     drop_longitude: float = Field(..., description="Drop point longitude")
     drop_latitude: float = Field(..., description="Drop point latitude")
-    total_users_threshold_percent: float = Field(...,description="Threshold percentage for filtering results")
+    total_users_threshold_percent: float = Field(..., description="Threshold percentage for filtering results")
+    hour_prm: float = Field(..., description="Hour send by user")
+    minute_prm: float = Field(..., description="Minute send by user")
     max_radius_km: float = Field(2.5, gt=0, le=10, description="Maximum radius in km")
     grid_spacing_km: float = Field(1.0, gt=0, le=5, description="Grid spacing in km")
     polygon_csv_path: Optional[str] = Field(None, description="Path to polygon zones CSV file")
@@ -57,9 +57,6 @@ class PredictionPoint(BaseModel):
     latitude: float
     longitude: float
     distance_km: float
-    grid_i: int
-    grid_j: int
-    point_type: str
     predicted_users: int
     prediction_radius_m: int = 500
     prediction_probability: float = Field(..., description="Confidence probability of the prediction (0-1)")
@@ -98,7 +95,8 @@ async def startup_event():
 
     try:
         # Load ML models
-        if os.path.exists('week_model.pkl') and os.path.exists('week_scaler.pkl'):#right now working with the simple model and scaler
+        if os.path.exists('week_model.pkl') and os.path.exists(
+                'week_scaler.pkl'):  # right now working with the simple model and scaler
             model_path = joblib.load('week_model.pkl')
             scaler = joblib.load('week_scaler.pkl')
             print("✅ ML models loaded successfully")
@@ -124,7 +122,26 @@ async def startup_event():
         print(f"❌ Startup error: {e}")
 
 
-def predict_at_droppoint(drop_longitude: float, drop_latitude: float) -> tuple:
+def convert_to_utc(hour_prm=None, minute_prm=None):
+    # Get current UTC time
+    utc_now = datetime.now(timezone.utc)
+
+    if hour_prm is not None and minute_prm is not None:
+        # Assume user entered hour/minute is LOCAL, so we shift relative to UTC
+        user_time = utc_now.replace(hour=hour_prm, minute=minute_prm, second=0, microsecond=0)
+        utc_time = user_time.astimezone(timezone.utc)
+    else:
+        # If no input, just take current UTC
+        utc_time = utc_now
+
+    # Extract separately
+    hour = utc_time.hour
+    minute = utc_time.minute
+
+    return hour, minute
+
+
+def predict_at_droppoint(drop_longitude: float, drop_latitude: float, hour_prm: int, minute_prm: int) -> tuple:
     """
     Prediction function - predicts number of users within 500m radius of the given point
     Returns: (prediction_value, confidence_probability)
@@ -139,14 +156,20 @@ def predict_at_droppoint(drop_longitude: float, drop_latitude: float) -> tuple:
         utcTime = datetime.utcnow()
         time = str(utcTime.time())
         time = time.split(sep=':')
-        hour = int(time[0])
-        minute = int(time[1])+10
+        if hour_prm is not None and minute_prm is not None:
+            hour, minute = convert_to_utc(hour_prm, minute_prm)
+
+            print("hour send by the user:", hour)
+            print("Minute send by the user:", minute)
+        else:
+            hour = int(time[0])
+            minute = int(time[1])
         second = int(float(time[2]))
 
         day = utcTime.weekday()
 
         # Formation Input
-        input_data = [[drop_longitude, drop_latitude, hour, minute,second]]
+        input_data = [[drop_longitude, drop_latitude, hour, minute, second]]
 
         # Scaled Input
         scaled_input = scaler.transform(input_data)
@@ -187,56 +210,124 @@ def load_polygon_zones(csv_file_path: str) -> List[Dict]:
             return []
 
         polygon_df = pd.read_csv(csv_file_path)
+        print(f"CSV columns: {list(polygon_df.columns)}")
+        print(f"CSV shape: {polygon_df.shape}")
+
         polygons = []
 
         for index, row in polygon_df.iterrows():
             try:
                 coordinates = []
-                coord_cols = [col for col in polygon_df.columns if 'geometry.coordinates' in col]
-                coord_cols.sort()
 
-                for i in range(0, len(coord_cols), 2):
-                    if i + 1 < len(coord_cols):
-                        lon_col = coord_cols[i]
-                        lat_col = coord_cols[i + 1]
-                        lon = row[lon_col]
-                        lat = row[lat_col]
+                # Get all coordinate columns that match the pattern
+                coord_cols = [col for col in polygon_df.columns if 'geometry.coordinates[' in col]
+                coord_cols.sort()  # Sort to maintain order
+
+                print(f"Row {index} - Found coordinate columns: {coord_cols}")
+
+                # Group coordinates by their array index [0], [1], [2], etc.
+                coord_groups = {}
+                for col in coord_cols:
+                    # Extract the array indices from column name like 'geometry.coordinates[0][0]'
+                    try:
+                        # Find the pattern [X][Y] in the column name
+                        import re
+                        matches = re.findall(r'\[(\d+)\]\[(\d+)\]', col)
+                        if matches:
+                            outer_idx, inner_idx = int(matches[0][0]), int(matches[0][1])
+                            if outer_idx not in coord_groups:
+                                coord_groups[outer_idx] = {}
+                            coord_groups[outer_idx][inner_idx] = row[col]
+                    except Exception as e:
+                        print(f"Error parsing column {col}: {e}")
+                        continue
+
+                # Convert grouped coordinates to list of (lon, lat) tuples
+                for outer_idx in sorted(coord_groups.keys()):
+                    coord_pair = coord_groups[outer_idx]
+                    if 0 in coord_pair and 1 in coord_pair:  # lon and lat
+                        lon = coord_pair[0]
+                        lat = coord_pair[1]
 
                         if pd.notna(lon) and pd.notna(lat):
-                            coordinates.append((lon, lat))
+                            coordinates.append((float(lon), float(lat)))
+                            print(f"Added coordinate: ({lon}, {lat})")
+
+                print(f"Row {index} - Total coordinates found: {len(coordinates)}")
 
                 if len(coordinates) >= 3:
-                    polygon = Polygon(coordinates)
-                    polygons.append({
-                        'name': row['name'] if 'name' in row else f'Zone_{index}',
-                        'polygon': polygon,
-                        'index': index
-                    })
+                    # Close the polygon if not already closed
+                    if len(coordinates) > 0 and coordinates[0] != coordinates[-1]:
+                        coordinates.append(coordinates[0])
+
+                    try:
+                        polygon = Polygon(coordinates)
+
+                        # Only add valid polygons
+                        if polygon.is_valid:
+                            polygon_name = str(row['name']) if 'name' in row and pd.notna(
+                                row['name']) else f'Zone_{index}'
+                            polygons.append({
+                                'name': polygon_name,
+                                'polygon': polygon,
+                                'index': index
+                            })
+                            print(f"✅ Successfully loaded polygon: {polygon_name} with {len(coordinates)} coordinates")
+                        else:
+                            print(f"❌ Invalid polygon for row {index}")
+                    except Exception as e:
+                        print(f"❌ Error creating polygon for row {index}: {e}")
+                else:
+                    print(f"❌ Not enough coordinates for polygon at row {index}: {len(coordinates)} coordinates")
 
             except Exception as e:
-                print(f"Error processing polygon row {index}: {e}")
+                print(f"❌ Error processing polygon row {index}: {e}")
                 continue
 
-        print(f"Successfully loaded {len(polygons)} polygons")
+        print(f"Successfully loaded {len(polygons)} valid polygons out of {len(polygon_df)} rows")
+
+        # Print summary of loaded polygons
+        for p in polygons:
+            print(f"Polygon loaded: {p['name']}")
+
         return polygons
 
     except Exception as e:
-        print(f"Error loading polygon zones: {e}")
+        print(f"❌ Error loading polygon zones: {e}")
         return []
 
 
 def point_in_any_polygon(lat: float, lon: float, polygons: List[Dict]) -> tuple:
     """Check if a point is within any of the provided polygons"""
-    point = Point(lon, lat)
+    try:
+        point = Point(float(lon), float(lat))
+        print(f"Checking point ({lat}, {lon}) against {len(polygons)} polygons")
 
-    for polygon_info in polygons:
-        try:
-            if polygon_info['polygon'].contains(point):
-                return True, polygon_info['name']
-        except Exception:
-            continue
+        for polygon_info in polygons:
+            try:
+                polygon = polygon_info['polygon']
+                polygon_name = polygon_info['name']
 
-    return False, None
+                # Check if point is contained in polygon
+                if polygon.contains(point):
+                    print(f"✅ Point ({lat}, {lon}) is inside polygon: {polygon_name}")
+                    return True, polygon_name
+                else:
+                    # Also check if point is on the boundary
+                    if polygon.touches(point):
+                        print(f"✅ Point ({lat}, {lon}) is on boundary of polygon: {polygon_name}")
+                        return True, polygon_name
+
+            except Exception as e:
+                print(f"❌ Error checking point in polygon {polygon_info['name']}: {e}")
+                continue
+
+        print(f"❌ Point ({lat}, {lon}) is not inside any polygon")
+        return False, None
+
+    except Exception as e:
+        print(f"❌ Error in point_in_any_polygon: {e}")
+        return False, None
 
 
 def generate_systematic_grid_points(center_lat: float, center_lon: float,
@@ -261,14 +352,10 @@ def generate_systematic_grid_points(center_lat: float, center_lon: float,
             distance = geodesic((center_lat, center_lon), (lat, lon)).kilometers
 
             if distance <= max_radius_km:
-                point_type = 'center' if (i == 0 and j == 0) else 'grid'
                 points.append({
                     'latitude': lat,
                     'longitude': lon,
-                    'distance_km': distance,
-                    'grid_i': i,
-                    'grid_j': j,
-                    'point_type': point_type
+                    'distance_km': distance
                 })
 
     # Sort by distance from center
@@ -279,6 +366,7 @@ def generate_systematic_grid_points(center_lat: float, center_lon: float,
 def enhanced_systematic_prediction_system(drop_longitude: float, drop_latitude: float,
                                           polygon_csv_path: Optional[str] = None,
                                           total_users_threshold_percent: float = 35,
+                                          hour_prm: int = None, minute_prm: int = None,
                                           max_radius_km: float = 2.5,
                                           grid_spacing_km: float = 1.0) -> Dict:
     """Enhanced systematic prediction system with 1km grid spacing"""
@@ -292,9 +380,11 @@ def enhanced_systematic_prediction_system(drop_longitude: float, drop_latitude: 
     polygons = []
     if polygon_csv_path:
         polygons = load_polygon_zones(polygon_csv_path)
+        print(f"Loaded {len(polygons)} polygons for filtering")
 
     # Generate systematic grid points
     grid_points = generate_systematic_grid_points(center_lat, center_lon, max_radius_km, grid_spacing_km)
+    print(f"Generated {len(grid_points)} grid points")
 
     # Make predictions and filter by polygons if provided
     all_points = []
@@ -305,33 +395,33 @@ def enhanced_systematic_prediction_system(drop_longitude: float, drop_latitude: 
         lon = point['longitude']
 
         # Check polygon constraint if polygons are provided
+        poly_name = None
         if polygons:
             is_valid, poly_name = point_in_any_polygon(lat, lon, polygons)
             if not is_valid:
                 points_outside_polygon += 1
                 continue
-        else:
-            poly_name = None
 
         # Make prediction (now returns prediction and probability)
-        prediction, probability = predict_at_droppoint(lon, lat)
+        prediction, probability = predict_at_droppoint(lon, lat, hour_prm, minute_prm)
 
         point_data = {
             'latitude': lat,
             'longitude': lon,
             'distance_km': point['distance_km'],
-            'grid_i': point['grid_i'],
-            'grid_j': point['grid_j'],
-            'point_type': point['point_type'],
             'predicted_users': int(prediction),
             'prediction_radius_m': 500,
-            'prediction_probability': round(probability, 3)  # Round to 3 decimal places
+            'prediction_probability': round(probability, 3)
         }
 
+        # Add polygon name if found
         if poly_name:
             point_data['polygon_name'] = poly_name
 
         all_points.append(point_data)
+
+    print(f"Points outside polygons: {points_outside_polygon}")
+    print(f"Valid points for prediction: {len(all_points)}")
 
     if not all_points:
         return {
@@ -344,14 +434,18 @@ def enhanced_systematic_prediction_system(drop_longitude: float, drop_latitude: 
     # Convert to DataFrame for analysis
     df = pd.DataFrame(all_points)
 
-    print(total_users_threshold_percent)
+    print(f"Threshold percentage: {total_users_threshold_percent}")
 
     # Calculate statistics and apply threshold
     total_predicted_users = df['predicted_users'].sum()
     threshold_value = (total_users_threshold_percent / 100) * total_users_active_now
 
+    print(f"Threshold value: {threshold_value}")
+
     # Filter points above threshold
     filtered_df = df[df['predicted_users'] >= threshold_value].copy()
+
+    print(f"Points above threshold: {len(filtered_df)}")
 
     processing_time = (datetime.now() - start_time).total_seconds()
 
@@ -443,8 +537,6 @@ async def make_simple_prediction(request: SimplePredictionRequest):
 
 @app.post("/predict", response_model=PredictionResponse)
 async def make_prediction(request: PredictionRequest):
-
-
     print(request)
     """
     Make predictions for user demand in a grid around the specified drop point.
@@ -456,6 +548,8 @@ async def make_prediction(request: PredictionRequest):
             drop_latitude=request.drop_latitude,
             polygon_csv_path=request.polygon_csv_path,
             total_users_threshold_percent=request.total_users_threshold_percent,
+            hour_prm=request.hour_prm,
+            minute_prm=request.minute_prm,
             max_radius_km=request.max_radius_km,
             grid_spacing_km=request.grid_spacing_km
         )

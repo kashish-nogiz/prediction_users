@@ -60,7 +60,7 @@ class PredictionPoint(BaseModel):
     predicted_users: int
     prediction_radius_m: int = 500
     prediction_probability: float = Field(..., description="Confidence probability of the prediction (0-1)")
-    polygon_name: Optional[str] = None
+    # polygon_name: Optional[str] = None
 
 
 class PredictionResponse(BaseModel):

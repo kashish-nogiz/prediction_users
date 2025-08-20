@@ -1,5 +1,5 @@
 import numpy as np
-import panda as pd
+import pandas as pd
 import math
 import folium
 from datetime import datetime
